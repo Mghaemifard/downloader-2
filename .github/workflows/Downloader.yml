@@ -1,0 +1,667 @@
+name: 01- 🎬 Youtube Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: 'YouTube video URL'
+        required: true
+        type: string
+      quality:
+        description: 'Video quality (best, 1080, 720, 480, audio)'
+        required: false
+        default: 'best'
+        type: string
+      video_format:
+        description: 'Video format (if quality is not audio)'
+        required: false
+        default: 'mp4'
+        type: choice
+        options:
+          - 'mp4'
+          - 'mkv'
+          - 'webm'
+          - 'avi'
+          - 'mov'
+      audio_format:
+        description: 'Audio format (if quality=audio)'
+        required: false
+        default: 'mp3'
+        type: choice
+        options:
+          - 'mp3'
+          - 'm4a'
+          - 'opus'
+          - 'flac'
+          - 'aac'
+          - 'wav'
+      audio_bitrate:
+        description: 'Audio bitrate (if quality=audio) - 128, 192, 256, 320'
+        required: false
+        default: '320'
+        type: choice
+        options:
+          - '128'
+          - '192'
+          - '256'
+          - '320'
+      download_subtitles:
+        description: 'Download subtitles?'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      subtitle_languages:
+        description: 'Subtitle languages (comma-separated: en,fa,ar,de,fr,es,tr,ru)'
+        required: false
+        default: 'en,fa'
+        type: string
+      playlist_mode:
+        description: 'Handle as playlist?'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      max_filesize_mb:
+        description: 'Max file size per part (MB) - 0 for no split'
+        required: false
+        default: '90'
+        type: string
+      enable_throttle:
+        description: 'Enable speed throttle (avoid detection)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      embed_thumbnail:
+        description: 'Embed thumbnail in file?'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  download-youtube:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start WARP Container
+        run: |
+          echo "🚀 Starting Cloudflare WARP container..."
+
+          # Create docker network
+          docker network create warp-net || true
+
+          # Run WARP container
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+
+          echo "⏳ Waiting for WARP to initialize (30 seconds)..."
+          sleep 30
+
+          # Check WARP status
+          echo "🔍 Checking WARP status..."
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "✅ WARP is active!"
+              echo "$RESULT"
+              break
+            else
+              echo "⏳ Attempt $i/10 - WARP not ready yet, waiting..."
+              sleep 10
+            fi
+          done
+
+          # Final check
+          FINAL=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+          if echo "$FINAL" | grep -qE "warp=(on|plus)"; then
+            echo "✅ WARP proxy is ready!"
+          else
+            echo "⚠️ WARP might not be fully active, but continuing anyway..."
+            echo "Response: $FINAL"
+          fi
+
+      - name: Cache yt-dlp
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pip
+            /usr/local/bin/yt-dlp
+          key: ${{ runner.os }}-yt-dlp
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg zip curl jq bc
+          pip3 install --upgrade yt-dlp
+
+      - name: Download YouTube Video
+        run: |
+          URL="${{ github.event.inputs.youtube_url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          VIDEO_FORMAT="${{ github.event.inputs.video_format }}"
+          AUDIO_FORMAT="${{ github.event.inputs.audio_format }}"
+          AUDIO_BITRATE="${{ github.event.inputs.audio_bitrate }}"
+          DOWNLOAD_SUBS="${{ github.event.inputs.download_subtitles }}"
+          SUB_LANGS="${{ github.event.inputs.subtitle_languages }}"
+          PLAYLIST_MODE="${{ github.event.inputs.playlist_mode }}"
+          SPLIT_MB="${{ github.event.inputs.max_filesize_mb }}"
+          ENABLE_THROTTLE="${{ github.event.inputs.enable_throttle }}"
+          EMBED_THUMB="${{ github.event.inputs.embed_thumbnail }}"
+          
+          # Convert to bytes, if 0 then no split
+          if [ "$SPLIT_MB" -eq 0 ]; then
+            SPLIT_BYTES=999999999999  # Effectively no split
+          else
+            SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+          fi
+
+          mkdir -p videos tmp_downloads
+
+          echo "🏷️  AVASAM YouTube Downloader"
+          echo "🌐 https://avasam.ir"
+          echo ""
+          echo "📹 Downloading: $URL"
+          echo "📊 Quality: $QUALITY"
+          
+          # Video-specific settings
+          if [ "$QUALITY" != "audio" ]; then
+            echo "🎬 Video format: $VIDEO_FORMAT"
+          fi
+          
+          # Audio-specific settings
+          if [ "$QUALITY" = "audio" ]; then
+            echo "🎵 Audio format: $AUDIO_FORMAT"
+            echo "🎚️ Audio bitrate: ${AUDIO_BITRATE}kbps"
+          fi
+          
+          echo "📝 Subtitles: $DOWNLOAD_SUBS"
+          if [ "$DOWNLOAD_SUBS" = "true" ]; then
+            echo "🌐 Subtitle languages: $SUB_LANGS"
+          fi
+          echo "📋 Playlist mode: $PLAYLIST_MODE"
+          echo "📦 Split size: ${SPLIT_MB}MB per part"
+          echo "🐌 Speed throttle: $ENABLE_THROTTLE"
+          echo "🖼️ Embed thumbnail: $EMBED_THUMB"
+
+          # Set format based on quality
+          case "$QUALITY" in
+            "audio")
+              # Highest quality audio in specified format
+              FORMAT="bestaudio[ext=$AUDIO_FORMAT]/bestaudio"
+              # Extract audio with specified bitrate
+              EXTRACT_AUDIO="--extract-audio --audio-format $AUDIO_FORMAT --audio-quality ${AUDIO_BITRATE}k --postprocessor-args \"-ar 48000\""
+              OUTPUT_TEMPLATE="tmp_downloads/%(title)s.${AUDIO_FORMAT}"
+              MERGE_FORMAT=""
+              ;;
+            "best")
+              FORMAT="bestvideo[ext=$VIDEO_FORMAT]+bestaudio[ext=m4a]/best[ext=$VIDEO_FORMAT]/best"
+              EXTRACT_AUDIO=""
+              OUTPUT_TEMPLATE="tmp_downloads/%(title)s.${VIDEO_FORMAT}"
+              MERGE_FORMAT="--merge-output-format $VIDEO_FORMAT"
+              ;;
+            "1080")
+              FORMAT="bestvideo[height<=1080][ext=$VIDEO_FORMAT]+bestaudio[ext=m4a]/best[height<=1080][ext=$VIDEO_FORMAT]/best"
+              EXTRACT_AUDIO=""
+              OUTPUT_TEMPLATE="tmp_downloads/%(title)s.${VIDEO_FORMAT}"
+              MERGE_FORMAT="--merge-output-format $VIDEO_FORMAT"
+              ;;
+            "720")
+              FORMAT="bestvideo[height<=720][ext=$VIDEO_FORMAT]+bestaudio[ext=m4a]/best[height<=720][ext=$VIDEO_FORMAT]/best"
+              EXTRACT_AUDIO=""
+              OUTPUT_TEMPLATE="tmp_downloads/%(title)s.${VIDEO_FORMAT}"
+              MERGE_FORMAT="--merge-output-format $VIDEO_FORMAT"
+              ;;
+            "480")
+              FORMAT="bestvideo[height<=480][ext=$VIDEO_FORMAT]+bestaudio[ext=m4a]/best[height<=480][ext=$VIDEO_FORMAT]/best"
+              EXTRACT_AUDIO=""
+              OUTPUT_TEMPLATE="tmp_downloads/%(title)s.${VIDEO_FORMAT}"
+              MERGE_FORMAT="--merge-output-format $VIDEO_FORMAT"
+              ;;
+            *)
+              FORMAT="bestvideo[ext=$VIDEO_FORMAT]+bestaudio[ext=m4a]/best[ext=$VIDEO_FORMAT]/best"
+              EXTRACT_AUDIO=""
+              OUTPUT_TEMPLATE="tmp_downloads/%(title)s.${VIDEO_FORMAT}"
+              MERGE_FORMAT="--merge-output-format $VIDEO_FORMAT"
+              ;;
+          esac
+
+          # Build rate limiting option
+          THROTTLE_OPTION=""
+          if [ "$ENABLE_THROTTLE" = "true" ]; then
+            THROTTLE_OPTION="--limit-rate 5M"
+            echo "🐌 Speed throttled to 5MB/s"
+          fi
+
+          # Build thumbnail embedding option
+          THUMB_OPTION=""
+          if [ "$EMBED_THUMB" = "true" ] && [ "$QUALITY" != "audio" ]; then
+            THUMB_OPTION="--embed-thumbnail --convert-thumbnails jpg"
+            echo "🖼️ Will embed thumbnail in video file"
+          fi
+
+          # Build yt-dlp command
+          YT_CMD="yt-dlp \
+            --proxy \"socks5://127.0.0.1:1080\" \
+            --format \"$FORMAT\" \
+            --output \"$OUTPUT_TEMPLATE\" \
+            --retries 15 \
+            --fragment-retries 15 \
+            --concurrent-fragments 6 \
+            --no-check-certificates \
+            --prefer-free-formats \
+            --no-warnings \
+            $THROTTLE_OPTION \
+            $THUMB_OPTION \
+            --sleep-interval 5 \
+            --max-sleep-interval 15 \
+            --sleep-requests 2"
+
+          # Add merge format for videos
+          if [ "$QUALITY" != "audio" ]; then
+            YT_CMD="$YT_CMD $MERGE_FORMAT"
+          fi
+
+          # Add extract-audio for audio downloads
+          if [ "$QUALITY" = "audio" ]; then
+            YT_CMD="$YT_CMD $EXTRACT_AUDIO"
+            # Add thumbnail for audio if requested
+            if [ "$EMBED_THUMB" = "true" ]; then
+              YT_CMD="$YT_CMD --embed-thumbnail"
+              echo "🖼️ Will embed thumbnail in audio file"
+            fi
+          fi
+
+          # Add subtitle options
+          if [ "$DOWNLOAD_SUBS" = "true" ]; then
+            YT_CMD="$YT_CMD --write-subs --sub-langs $SUB_LANGS --write-auto-subs --embed-subs"
+            echo "🎯 Subtitles will be downloaded and embedded"
+          fi
+
+          # Add playlist options
+          if [ "$PLAYLIST_MODE" = "true" ]; then
+            YT_CMD="$YT_CMD --yes-playlist"
+            echo "🎯 Playlist mode enabled"
+          else
+            YT_CMD="$YT_CMD --no-playlist"
+          fi
+
+          # Execute download
+          eval "$YT_CMD \"$URL\"" || {
+            echo "❌ Primary download failed, trying alternative method..."
+            
+            # Alternative with different user agent and extractor args
+            if [ "$QUALITY" = "audio" ]; then
+              yt-dlp \
+                --proxy "socks5://127.0.0.1:1080" \
+                --format "bestaudio" \
+                --extract-audio \
+                --audio-format "$AUDIO_FORMAT" \
+                --audio-quality "${AUDIO_BITRATE}k" \
+                --output "$OUTPUT_TEMPLATE" \
+                --no-playlist \
+                --retries 10 \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                --extractor-args "youtube:player_client=android" \
+                "$URL"
+            else
+              yt-dlp \
+                --proxy "socks5://127.0.0.1:1080" \
+                --format "bestvideo+bestaudio" \
+                --merge-output-format "$VIDEO_FORMAT" \
+                --output "$OUTPUT_TEMPLATE" \
+                --no-playlist \
+                --retries 10 \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                --extractor-args "youtube:player_client=android" \
+                "$URL"
+            fi
+          }
+
+          echo "✅ Download complete!"
+          ls -la tmp_downloads/
+
+          # Get repository info for raw file links
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          # Create JSON metadata file for better organization
+          METADATA_FILE="videos/download_metadata_$(date +%Y%m%d_%H%M%S).json"
+          echo "{" > "$METADATA_FILE"
+          echo "  \"download_date\": \"$(date -Iseconds)\"," >> "$METADATA_FILE"
+          echo "  \"source_url\": \"$URL\"," >> "$METADATA_FILE"
+          echo "  \"quality\": \"$QUALITY\"," >> "$METADATA_FILE"
+          if [ "$QUALITY" != "audio" ]; then
+            echo "  \"video_format\": \"$VIDEO_FORMAT\"," >> "$METADATA_FILE"
+          fi
+          if [ "$QUALITY" = "audio" ]; then
+            echo "  \"audio_format\": \"$AUDIO_FORMAT\"," >> "$METADATA_FILE"
+            echo "  \"audio_bitrate\": \"${AUDIO_BITRATE}kbps\"," >> "$METADATA_FILE"
+          fi
+          echo "  \"split_size_mb\": $SPLIT_MB," >> "$METADATA_FILE"
+          echo "  \"files\": [" >> "$METADATA_FILE"
+
+          # Handle file splitting
+          FILE_INDEX=0
+          FIRST_FILE=true
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+            # Remove extension for folder name
+            FILENAME_NO_EXT="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
+            FILE_INDEX=$((FILE_INDEX + 1))
+
+            # Add to JSON
+            if [ "$FIRST_FILE" = true ]; then
+              FIRST_FILE=false
+            else
+              echo "," >> "$METADATA_FILE"
+            fi
+            echo "    {\"name\": \"$BASENAME\", \"size_mb\": $(( SIZE / 1024 / 1024 ))}" >> "$METADATA_FILE"
+
+            echo "📁 Processing: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
+
+            if [ "$SPLIT_MB" -ne 0 ] && [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
+              echo "✂️ Splitting $BASENAME into ${SPLIT_MB}MB parts..."
+
+              # Create folder for split files using the original filename (without extension)
+              mkdir -p "videos/${FILENAME_NO_EXT}"
+
+              # Use a simple temp name to avoid special character issues with zip -s
+              TEMP_NAME="temparchive${FILE_INDEX}"
+
+              # Copy file to a temp location with simple name
+              cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+
+              # Create split archive in tmp_downloads with simple name
+              cd tmp_downloads
+              zip -0 -s "${SPLIT_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+
+              # Move and rename all parts to the destination folder with original name
+              PART_FILES=()
+              for part in ${TEMP_NAME}.z* ${TEMP_NAME}.zip; do
+                if [ -f "$part" ]; then
+                  # Get the extension (z01, z02, zip, etc)
+                  PART_EXT="${part##*.}"
+                  mv "$part" "../videos/${FILENAME_NO_EXT}/${FILENAME_NO_EXT}.${PART_EXT}"
+                  PART_FILES+=("${FILENAME_NO_EXT}.${PART_EXT}")
+                  echo "  📦 Created: ${FILENAME_NO_EXT}.${PART_EXT}"
+                fi
+              done
+
+              # Clean up temp file
+              rm -f "${TEMP_NAME}.${EXT}"
+              cd ..
+
+              PART_COUNT=$(ls "videos/${FILENAME_NO_EXT}/" 2>/dev/null | wc -l)
+              echo "✅ Created $PART_COUNT parts in videos/${FILENAME_NO_EXT}/"
+
+              # Calculate total size of all parts
+              TOTAL_SIZE=0
+              for part_file in "videos/${FILENAME_NO_EXT}"/*; do
+                if [ -f "$part_file" ]; then
+                  PART_SIZE=$(stat -c%s "$part_file")
+                  TOTAL_SIZE=$((TOTAL_SIZE + PART_SIZE))
+                fi
+              done
+              TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
+
+              # Generate download links
+              DOWNLOAD_LINKS=""
+              FOLDER_ENCODED=$(echo "${FILENAME_NO_EXT}" | sed 's/ /%20/g')
+              for part_file in "videos/${FILENAME_NO_EXT}"/*; do
+                if [ -f "$part_file" ]; then
+                  PART_BASENAME=$(basename "$part_file")
+                  PART_ENCODED=$(echo "${PART_BASENAME}" | sed 's/ /%20/g')
+                  RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${PART_ENCODED}"
+                  DOWNLOAD_LINKS="${DOWNLOAD_LINKS}${RAW_LINK}"$'\n'
+                fi
+              done
+
+              # Create info file for split content
+              INFO_FILE="videos/${FILENAME_NO_EXT}/INFO.txt"
+              {
+                printf '%s\n' "╔══════════════════════════════════════════════════════════════════╗"
+                printf '%s\n' "║                    🎬 AVASAM YouTube Downloader                   ║"
+                printf '%s\n' "║                       https://avasam.ir                           ║"
+                printf '%s\n' "╚══════════════════════════════════════════════════════════════════╝"
+                printf '\n'
+                if [ "$QUALITY" = "audio" ]; then
+                  printf '%s\n' "🎵 AUDIO INFORMATION"
+                else
+                  printf '%s\n' "📹 VIDEO INFORMATION"
+                fi
+                printf '%s\n' "═══════════════════════════════════════════════════════════════════"
+                printf '\n'
+                if [ "$QUALITY" = "audio" ]; then
+                  printf '%s\n' "1️⃣  Track Name"
+                else
+                  printf '%s\n' "1️⃣  Video Name"
+                fi
+                printf '%s\n' "    ${FILENAME_NO_EXT}"
+                printf '\n'
+                printf '%s\n' "2️⃣  Original YouTube Link"
+                printf '%s\n' "    ${URL}"
+                printf '\n'
+                printf '%s\n' "3️⃣  Total Downloaded Size"
+                printf '%s\n' "    📦 ${PART_COUNT} zip parts | 💾 Total: ${TOTAL_SIZE_MB} MB"
+                printf '\n'
+                if [ "$QUALITY" = "audio" ]; then
+                  printf '%s\n' "4️⃣  Audio Details"
+                  printf '%s\n' "    🎵 Format: ${AUDIO_FORMAT} | 🎚️ Bitrate: ${AUDIO_BITRATE}kbps"
+                else
+                  printf '%s\n' "4️⃣  Video Details"
+                  printf '%s\n' "    🎬 Format: ${VIDEO_FORMAT} | 🎯 Quality: ${QUALITY}"
+                fi
+                if [ "$DOWNLOAD_SUBS" = "true" ]; then
+                  printf '\n'
+                  printf '%s\n' "5️⃣  Subtitles"
+                  printf '%s\n' "    🌐 Languages: ${SUB_LANGS} (embedded)"
+                fi
+                printf '\n'
+                printf '%s\n' "6️⃣  Download Links (GitHub Raw)"
+                printf '%s\n' "═══════════════════════════════════════════════════════════════════"
+                printf '%s' "${DOWNLOAD_LINKS}"
+                printf '%s\n' "═══════════════════════════════════════════════════════════════════"
+                printf '\n'
+                printf '%s\n' "7️⃣  Download Status"
+                printf '%s\n' "    ✅ 100% Downloaded - Complete!"
+                printf '\n'
+                printf '%s\n' "    Progress: [████████████████████] 100%"
+                printf '\n'
+                printf '%s\n' "    ✅ All parts downloaded successfully!"
+                printf '%s\n' "    ✅ Files are ready to use!"
+                printf '\n'
+                printf '%s\n' "    📋 How to extract"
+                printf '%s\n' "    • Download all .zip and .z01, .z02... files"
+                printf '%s\n' "    • Use 7-Zip or WinRAR to extract the .zip file"
+                printf '%s\n' "    • All parts will be combined automatically"
+                printf '\n'
+                printf '%s\n' "═══════════════════════════════════════════════════════════════════"
+                printf '%s\n' "                    🏷️ Generated by AVASAM"
+                printf '%s\n' "                      https://avasam.ir"
+                printf '%s\n' "═══════════════════════════════════════════════════════════════════"
+              } > "$INFO_FILE"
+
+              echo "📄 Created INFO.txt in videos/${FILENAME_NO_EXT}/"
+
+            else
+              cp "$FILE" "videos/$BASENAME"
+              echo "✅ Copied as-is (no split needed)"
+
+              # For non-split files, create a simple info file in videos folder
+              SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+              FILE_ENCODED=$(echo "${BASENAME}" | sed 's/ /%20/g')
+              RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FILE_ENCODED}"
+
+              # Create info file for single file
+              INFO_FILE="videos/${FILENAME_NO_EXT}_INFO.txt"
+              {
+                printf '%s\n' "╔══════════════════════════════════════════════════════════════════╗"
+                printf '%s\n' "║                    🎬 AVASAM YouTube Downloader                   ║"
+                printf '%s\n' "║                       https://avasam.ir                           ║"
+                printf '%s\n' "╚══════════════════════════════════════════════════════════════════╝"
+                printf '\n'
+                if [ "$QUALITY" = "audio" ]; then
+                  printf '%s\n' "🎵 AUDIO INFORMATION"
+                else
+                  printf '%s\n' "📹 VIDEO INFORMATION"
+                fi
+                printf '%s\n' "═══════════════════════════════════════════════════════════════════"
+                printf '\n'
+                if [ "$QUALITY" = "audio" ]; then
+                  printf '%s\n' "1️⃣  Track Name"
+                else
+                  printf '%s\n' "1️⃣  Video Name"
+                fi
+                printf '%s\n' "    ${FILENAME_NO_EXT}"
+                printf '\n'
+                printf '%s\n' "2️⃣  Original YouTube Link"
+                printf '%s\n' "    ${URL}"
+                printf '\n'
+                printf '%s\n' "3️⃣  Total Downloaded Size"
+                printf '%s\n' "    📦 1 file | 💾 Total: ${SIZE_MB} MB"
+                printf '\n'
+                if [ "$QUALITY" = "audio" ]; then
+                  printf '%s\n' "4️⃣  Audio Details"
+                  printf '%s\n' "    🎵 Format: ${AUDIO_FORMAT} | 🎚️ Bitrate: ${AUDIO_BITRATE}kbps"
+                else
+                  printf '%s\n' "4️⃣  Video Details"
+                  printf '%s\n' "    🎬 Format: ${VIDEO_FORMAT} | 🎯 Quality: ${QUALITY}"
+                fi
+                if [ "$DOWNLOAD_SUBS" = "true" ]; then
+                  printf '\n'
+                  printf '%s\n' "5️⃣  Subtitles"
+                  printf '%s\n' "    🌐 Languages: ${SUB_LANGS} (embedded)"
+                fi
+                printf '\n'
+                printf '%s\n' "6️⃣  Download Link (GitHub Raw)"
+                printf '%s\n' "═══════════════════════════════════════════════════════════════════"
+                printf '%s\n' "${RAW_LINK}"
+                printf '%s\n' "═══════════════════════════════════════════════════════════════════"
+                printf '\n'
+                printf '%s\n' "7️⃣  Download Status"
+                printf '%s\n' "    ✅ 100% Downloaded - Complete!"
+                printf '\n'
+                printf '%s\n' "    Progress: [████████████████████] 100%"
+                printf '\n'
+                printf '%s\n' "    ✅ File downloaded successfully!"
+                printf '%s\n' "    ✅ Ready to use!"
+                printf '\n'
+                printf '%s\n' "═══════════════════════════════════════════════════════════════════"
+                printf '%s\n' "                    🏷️ Generated by AVASAM"
+                printf '%s\n' "                      https://avasam.ir"
+                printf '%s\n' "═══════════════════════════════════════════════════════════════════"
+              } > "$INFO_FILE"
+
+              echo "📄 Created ${FILENAME_NO_EXT}_INFO.txt"
+            fi
+          done
+          
+          # Close JSON array and object
+          echo "" >> "$METADATA_FILE"
+          echo "  ]" >> "$METADATA_FILE"
+          echo "}" >> "$METADATA_FILE"
+          
+          echo "📊 Created metadata file: $METADATA_FILE"
+          
+          rm -rf tmp_downloads
+
+      - name: Generate Download Summary
+        run: |
+          echo "## 📥 Download Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Source:** ${{ github.event.inputs.youtube_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Quality:** ${{ github.event.inputs.quality }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.quality }}" != "audio" ]; then
+            echo "**Video Format:** ${{ github.event.inputs.video_format }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "${{ github.event.inputs.quality }}" = "audio" ]; then
+            echo "**Audio Format:** ${{ github.event.inputs.audio_format }} @ ${{ github.event.inputs.audio_bitrate }}kbps" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**Subtitles:** ${{ github.event.inputs.download_subtitles }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.download_subtitles }}" = "true" ]; then
+            echo "**Subtitle Languages:** ${{ github.event.inputs.subtitle_languages }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**Playlist Mode:** ${{ github.event.inputs.playlist_mode }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Max File Size:** ${{ github.event.inputs.max_filesize_mb }}MB per part" >> $GITHUB_STEP_SUMMARY
+          echo "**Embed Thumbnail:** ${{ github.event.inputs.embed_thumbnail }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📂 Files in videos folder:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lah videos/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 💾 Storage Used:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          du -sh videos/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Stop WARP Container
+        if: always()
+        run: |
+          docker stop warp || true
+          docker rm warp || true
+
+      - name: Commit & Push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          echo "🏷️  AVASAM (https://avasam.ir) - Preparing to commit files"
+
+          if [ ! -d "videos" ] || [ -z "$(ls -A videos 2>/dev/null)" ]; then
+            echo "❌ No files to commit in videos folder"
+            exit 1
+          fi
+
+          git add videos/
+          
+          if git diff --staged --quiet; then
+            echo "❌ No files were staged for commit"
+            echo "Files in videos folder:"
+            ls -la videos/
+            exit 1
+          fi
+
+          TOTAL=$(git diff --staged --name-only | wc -l)
+          echo "📦 Total files to push: $TOTAL"
+
+          echo "🚀 Committing $TOTAL file(s)"
+          git commit -m "[AVASAM] YouTube download [skip ci]"
+
+          echo "🔄 Pulling latest changes..."
+          git pull --rebase origin "$BRANCH" || true
+          
+          echo "📤 Pushing to GitHub..."
+          git push origin HEAD:"$BRANCH"
+
+          echo "🎉 Successfully pushed $TOTAL file(s) — AVASAM (https://avasam.ir)"
